@@ -232,6 +232,8 @@ class Block:
     content: list = field(default_factory=list)
     space_id: str = ""
     parent_id: str = ""
+    collection_id: str = ""
+    view_ids: list = field(default_factory=list)
 
 
 class NotionExporter:
@@ -305,6 +307,8 @@ class NotionExporter:
                     content=v.get("content", []),
                     space_id=v.get("space_id", ""),
                     parent_id=v.get("parent_id", ""),
+                    collection_id=v.get("collection_id", ""),
+                    view_ids=v.get("view_ids", []),
                 )
                 blocks[bid] = block
 
@@ -316,6 +320,130 @@ class NotionExporter:
             time.sleep(0.05)
 
         return blocks
+
+    def _parse_record_blocks(self, record_map: dict) -> dict[str, Block]:
+        blocks = {}
+        for bid, bdata in record_map.get("block", {}).items():
+            v = bdata.get("value", {}).get("value", bdata.get("value", {}))
+            if not v:
+                continue
+            blocks[bid] = Block(
+                id=bid,
+                type=v.get("type", "unknown"),
+                properties=v.get("properties", {}),
+                format=v.get("format", {}),
+                content=v.get("content", []),
+                space_id=v.get("space_id", ""),
+                parent_id=v.get("parent_id", ""),
+                collection_id=v.get("collection_id", ""),
+            )
+        return blocks
+
+    def _fetch_toggle_children(self, block_id: str, space_id: str) -> dict[str, Block]:
+        """Fetch a toggle block's children via loadCachedPageChunks (they are not
+        included in the page's block tree)."""
+        payload = {
+            "requests": [
+                {
+                    "page": {"id": block_id, "spaceId": space_id},
+                    "cursor": {"stack": []},
+                    "verticalColumns": False,
+                }
+            ]
+        }
+        try:
+            resp = self.session.post(self._api_url("loadCachedPageChunks"), json=payload, timeout=30)
+            resp.raise_for_status()
+            return self._parse_record_blocks(resp.json().get("recordMap", {}))
+        except requests.RequestException as e:
+            print(f"  [!] Failed to fetch toggle children {block_id}: {e}", file=sys.stderr)
+            return {}
+
+    def _fetch_collection_rows(self, collection_id: str, view_id: str, space_id: str) -> dict[str, Block]:
+        """Fetch rows of an embedded collection view (database) via queryCollection."""
+        payload = {
+            "clientType": "notion_app",
+            "source": {"type": "collection", "id": collection_id, "spaceId": space_id},
+            "collectionView": {"id": view_id, "spaceId": space_id},
+            "loader": {
+                "reducers": {"collection_group_results": {"type": "results", "limit": 100}},
+                "sort": [],
+                "searchQuery": "",
+                "archiveStatus": "NON_ARCHIVED",
+                "userTimeZone": "Asia/Jakarta",
+            },
+        }
+        try:
+            resp = self.session.post(self._api_url("queryCollection"), json=payload, timeout=30)
+            resp.raise_for_status()
+            return self._parse_record_blocks(resp.json().get("recordMap", {}))
+        except requests.RequestException as e:
+            print(f"  [!] Failed to fetch collection {collection_id}: {e}", file=sys.stderr)
+            return {}
+
+    def _expand_lazy_content(self, page_blocks: dict[str, Block]):
+        """Backfill toggle children and collection view rows for a page's blocks."""
+        space_id = next((b.space_id for b in page_blocks.values() if b.space_id), "")
+        # --- toggles (recursive) ---
+        queue = [b for b in page_blocks.values() if b.type == "toggle"]
+        processed = set()
+        while queue:
+            tb = queue.pop(0)
+            if tb.id in processed:
+                continue
+            processed.add(tb.id)
+            if tb.content and all(self.all_blocks.get(cid) for cid in tb.content):
+                # children already fetched; queue nested toggles
+                for cid in tb.content:
+                    c = self.all_blocks.get(cid) or page_blocks.get(cid)
+                    if c and c.type == "toggle":
+                        queue.append(c)
+                continue
+            new_blocks = self._fetch_toggle_children(tb.id, tb.space_id or space_id)
+            time.sleep(0.1)
+            for bid, nb in new_blocks.items():
+                if bid not in self.all_blocks:
+                    self.all_blocks[bid] = nb
+                    page_blocks.setdefault(bid, nb)
+            if new_blocks:
+                tb.content = [cid for cid in new_blocks if new_blocks[cid].parent_id == tb.id] or list(new_blocks.keys())
+            for cid in tb.content:
+                c = new_blocks.get(cid)
+                if c and c.type == "toggle":
+                    queue.append(c)
+        # --- any block whose referenced children are missing (e.g. callouts) ---
+        for _ in range(3):
+            pending = []
+            for b in list(page_blocks.values()):
+                missing_kids = [cid for cid in b.content if cid not in self.all_blocks]
+                if missing_kids:
+                    pending.append(b)
+            if not pending:
+                break
+            for b in pending:
+                new_blocks = self._fetch_toggle_children(b.id, b.space_id or space_id)
+                time.sleep(0.1)
+                for bid, nb in new_blocks.items():
+                    self.all_blocks.setdefault(bid, nb)
+                    page_blocks.setdefault(bid, nb)
+        # --- collection views ---
+        for b in list(page_blocks.values()):
+            if b.type not in ("collection_view", "collection_view_page"):
+                continue
+            view_ids = b.view_ids or b.format.get("collection_view_ids", []) or [None]
+            rows = {}
+            if b.collection_id:
+                for vid in view_ids[:1]:
+                    rows = self._fetch_collection_rows(b.collection_id, vid, b.space_id or space_id)
+                    time.sleep(0.1)
+                    if rows:
+                        break
+            row_pages = [rb for rb in rows.values() if rb.type == "page" and rb.parent_id == b.collection_id]
+            b.content = [rb.id for rb in row_pages]
+            for rb in row_pages:
+                self.all_blocks.setdefault(rb.id, rb)
+                page_blocks.setdefault(rb.id, rb)
+                self.crawl(rb.id)
 
     def crawl(self, page_id: str = None, depth: int = 0):
         if page_id is None:
@@ -334,6 +462,8 @@ class NotionExporter:
             indent = "  " * depth
             print(f"{indent}[page] {title}")
             self.page_order.append(page_id)
+
+        self._expand_lazy_content(blocks)
 
         if page_block and page_block.content:
             for child_id in page_block.content:
@@ -517,7 +647,14 @@ class NotionExporter:
         elif t == "callout":
             text = self._get_rich_html(props.get("title", []))
             icon = fmt.get("page_icon", "")
-            return f'<div class="callout"><span class="callout-icon">{icon}</span><div>{text}</div></div>'
+            plain_title = re.sub(r"<[^>]+>", "", text)
+            children_html = self._render_children(block)
+            plain_children = re.sub(r"<[^>]+>", "", children_html).strip()
+            # avoid duplicating text that already lives in the callout title
+            if plain_children and plain_children in plain_title:
+                children_html = ""
+            body = text + children_html
+            return f'<div class="callout"><span class="callout-icon">{icon}</span><div>{body}</div></div>'
 
         elif t == "quote":
             text = self._get_rich_html(props.get("title", []))
@@ -577,16 +714,48 @@ class NotionExporter:
         elif t == "page":
             return ""
 
+        elif t in ("collection_view", "collection_view_page"):
+            parts = []
+            for row_id in block.content:
+                row = self.all_blocks.get(row_id)
+                if not row:
+                    continue
+                title = self._get_text(row.properties.get("title", []))
+                anchor = row_id.replace("-", "")
+                icon = row.format.get("page_icon", "")
+                parts.append(f'<li><a href="#{anchor}">{icon} {title}</a></li>')
+            if parts:
+                return f"<ul>{''.join(parts)}</ul>"
+            return ""
+
         return ""
 
     def _render_children(self, block: Block) -> str:
         if not block.content:
             return ""
+        return self._render_block_ids(block.content)
+
+    def _render_block_ids(self, ids: list) -> str:
+        """Render a sequence of block ids, merging consecutive numbered_list
+        blocks into a single <ol> so numbering doesn't restart at 1."""
         parts = []
-        for child_id in block.content:
+        ol_run = []
+        def flush_ol():
+            if ol_run:
+                parts.append("<ol>" + "".join(f"<li>{i}</li>" for i in ol_run) + "</ol>")
+                ol_run.clear()
+        for child_id in ids:
             child = self.all_blocks.get(child_id)
-            if child and child.type != "page":
-                parts.append(self._render_block(child))
+            if not child or child.type == "page":
+                continue
+            if child.type == "numbered_list":
+                text = self._get_rich_html(child.properties.get("title", []))
+                inner = self._render_block_ids(child.content or [])
+                ol_run.append(text + inner)
+                continue
+            flush_ol()
+            parts.append(self._render_block(child))
+        flush_ol()
         return "\n".join(parts)
 
     def _render_table(self, block: Block) -> str:
@@ -627,15 +796,11 @@ class NotionExporter:
         parts = [f'<h{heading_level} id="{anchor}">{icon_html}{title}</h{heading_level}>']
 
         if block.content:
-            for child_id in block.content:
-                child = self.all_blocks.get(child_id)
-                if not child:
-                    continue
-                if child.type == "page":
-                    continue
-                rendered = self._render_block(child)
-                if rendered:
-                    parts.append(rendered)
+            rendered_ids = [cid for cid in block.content
+                            if self.all_blocks.get(cid) and self.all_blocks[cid].type != "page"]
+            body = self._render_block_ids(rendered_ids)
+            if body:
+                parts.append(body)
 
         return "\n".join(parts)
 
